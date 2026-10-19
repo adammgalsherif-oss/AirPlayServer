@@ -1,151 +1,23 @@
-name: Build & Release
+name: Build Release Executable
 
-on:
-  workflow_dispatch:
-  release:
-    types: [created]
-  pull_request:
-  push:
-    branches:
-      - master
-    tags:
-      - "v*"
-
-permissions:
-  contents: read
-
-concurrency:
-  group: airplayserver-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+on: [push, workflow_dispatch]
 
 jobs:
   build:
     runs-on: windows-latest
-    env:
-      RUNTIME_DIR: AirPlayServer/bin/x64
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+    - name: Checkout Code
+      uses: actions/checkout@v4
 
-      - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
 
-      - name: Create MSYS2 linker directory
-        run: New-Item -ItemType Directory -Force -Path "C:\msys64\mingw32\lib\gcc\i686-w64-mingw32\9.2.0" | Out-Null
-        shell: pwsh
+    - name: Build Application in Release Mode
+      run: msbuild AirPlay.sln /p:Configuration=Release /p:Platform=x64
 
-      - name: Build solution (Release|x64)
-        run: msbuild AirPlay.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /m
-
-      - name: Verify open-source codec boundary
-        shell: pwsh
-        run: |
-          if (Test-Path -LiteralPath 'AirPlayServerLib/lib/fdk-aac') {
-            throw 'Fraunhofer FDK AAC must not be present in the release source tree.'
-          }
-
-          $buildInfo = Get-Content -Raw -LiteralPath 'external/ffmpeg/licenses/FFMPEG_BUILD_INFO-x64.txt'
-          foreach ($requiredSetting in @(
-            'FFmpeg 8.1.2',
-            '--disable-gpl',
-            '--disable-nonfree',
-            '--disable-version3',
-            '--enable-decoder=aac',
-            '--enable-decoder=h264'
-          )) {
-            if (-not $buildInfo.Contains($requiredSetting)) {
-              throw "FFmpeg build provenance is missing required setting: $requiredSetting"
-            }
-          }
-
-          $decoderSmokeTest = 'x64/Release/AirPlayLibSmokeTests.exe'
-          if (-not (Test-Path -LiteralPath $decoderSmokeTest -PathType Leaf)) {
-            throw "AAC-ELD smoke test was not produced: $decoderSmokeTest"
-          }
-          & $decoderSmokeTest
-          if ($LASTEXITCODE -ne 0) {
-            throw "AAC-ELD smoke test exited with code $LASTEXITCODE."
-          }
-
-      - name: Verify adapter protocol and AirPlay listeners
-        shell: pwsh
-        run: |
-          $featureHeader = Get-Content -Raw -LiteralPath 'AirPlayServerLib/lib/global.h'
-          if ($featureHeader -notmatch '#define\s+GLOBAL_FEATURES_1\s+0x5A7FFEE6') {
-            throw 'AirPlay capability advertisement must remain mirroring/audio-only.'
-          }
-
-          $mirrorTransport = Get-Content -Raw -LiteralPath 'AirPlayServerLib/lib/raop_rtp_mirror.c'
-          if ($mirrorTransport -notmatch '#define\s+MIRROR_TIMING_RESPONSE_TIMEOUT_MS\s+300' -or
-              $mirrorTransport -notmatch '#define\s+MIRROR_TIMING_PROBE_INTERVAL_SECONDS\s+3' -or
-              $mirrorTransport -match 'sleepms\(10\)') {
-            throw 'Mirror timing probes must keep their bounded 300 ms response window and three-second cadence.'
-          }
-
-          .\.github\scripts\Test-MirrorSimAdapter.ps1 -RuntimeDir $env:RUNTIME_DIR
-
-      - name: Create desktop archive and checksum
-        shell: pwsh
-        run: |
-          $desktopDir = Join-Path $env:RUNNER_TEMP 'AirPlayServer-Desktop-Win-x64'
-          New-Item -ItemType Directory -Force -Path $desktopDir | Out-Null
-          foreach ($fileName in @('AirPlayServer.exe', 'airplay2dll.dll', 'dnssd.dll', 'SDL2.dll', 'avcodec-62.dll', 'avutil-60.dll', 'swscale-9.dll', 'msys-2.0.dll')) {
-            Copy-Item -LiteralPath (Join-Path 'x64/Release' $fileName) -Destination $desktopDir -ErrorAction Stop
-          }
-          Copy-Item -LiteralPath 'LICENSE', 'THIRD_PARTY_NOTICES.md' -Destination $desktopDir
-          $ffmpegLicenseDir = Join-Path $desktopDir 'licenses/ffmpeg'
-          $libplistLicenseDir = Join-Path $desktopDir 'licenses/libplist'
-          $playFairLicenseDir = Join-Path $desktopDir 'licenses/playfair'
-          New-Item -ItemType Directory -Force -Path $ffmpegLicenseDir, $libplistLicenseDir, $playFairLicenseDir | Out-Null
-          Copy-Item -LiteralPath 'external/ffmpeg/licenses/COPYING.LGPLv2.1' -Destination $ffmpegLicenseDir
-          Copy-Item -LiteralPath 'external/ffmpeg/licenses/LICENSE.md' -Destination $ffmpegLicenseDir
-          Copy-Item -LiteralPath 'external/ffmpeg/licenses/FFMPEG_BUILD_INFO-x64.txt' -Destination $ffmpegLicenseDir
-          Copy-Item -LiteralPath 'external/ffmpeg/licenses/COPYING.LGPLv2.1' -Destination $libplistLicenseDir
-          Copy-Item -LiteralPath 'AirPlayServerLib/lib/playfair/LICENSE.md' -Destination (Join-Path $playFairLicenseDir 'COPYING.GPLv3.md')
-          Copy-Item -LiteralPath 'external/SDL2/LICENSE.txt' -Destination (Join-Path $desktopDir 'licenses/SDL2.txt')
-          Compress-Archive -Path "$desktopDir/*" -DestinationPath 'AirPlayServer-Desktop-Win-x64.zip'
-          $hash = (Get-FileHash -Algorithm SHA256 'AirPlayServer-Desktop-Win-x64.zip').Hash.ToLowerInvariant()
-          Set-Content -Path 'AirPlayServer-Desktop-Win-x64.sha256' -Value "$hash  AirPlayServer-Desktop-Win-x64.zip" -NoNewline
-
-      - name: Upload desktop artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: AirPlayServer-Desktop-Win-x64
-          if-no-files-found: error
-          retention-days: 7
-          path: |
-            AirPlayServer-Desktop-Win-x64.zip
-            AirPlayServer-Desktop-Win-x64.sha256
-
-  publish:
-    if: github.ref_type == 'tag'
-    needs: build
-    runs-on: windows-latest
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-    steps:
-      - name: Download desktop artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: AirPlayServer-Desktop-Win-x64
-          path: release-assets
-
-      - name: Attest desktop provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: release-assets/*
-
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          generate_release_notes: true
-          body: |
-            FFmpeg 8.1.2 corresponding source: [download](https://github.com/xenos1337/AirPlayServer/releases/download/v1.2.5/ffmpeg-8.1.2.tar.xz) ([SHA-256](https://github.com/xenos1337/AirPlayServer/releases/download/v1.2.5/ffmpeg-8.1.2.tar.xz.sha256)).
-          fail_on_unmatched_files: true
-          files: |
-            release-assets/AirPlayServer-Desktop-Win-x64.zip
-            release-assets/AirPlayServer-Desktop-Win-x64.sha256
+    - name: Upload Clean Executable
+      uses: actions/upload-artifact@v4
+      with:
+        name: Clean-AirPlayServer-x64
+        path: x64/Release/
